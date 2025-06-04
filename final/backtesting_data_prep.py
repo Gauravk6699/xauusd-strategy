@@ -68,7 +68,8 @@ SMA_PERIOD_ON_RSI = 14
 INITIAL_BALANCE = 100000.0
 TRADE_UNITS = 200.0
 PIP_VALUE_XAU_USD = 0.01
-RR_MULTIPLIER = 2.5 # Risk-to-Reward Multiplier (e.g., 2.5 means 1:2.5 R:R)
+# RR_MULTIPLIER = 2.5 # Risk-to-Reward Multiplier (e.g., 2.5 means 1:2.5 R:R) - Now using S/R for TP
+MIN_SL_DISTANCE_PIPS = 10 # Minimum distance for stop loss in pips
 
 # Strategy Parameters - Trading Hours (UTC)
 TRADING_WINDOWS_UTC = {
@@ -372,18 +373,62 @@ def execute_backtest(df_5m, all_tf_data, losing_trades_conn, initial_balance, un
     df_4h = all_tf_data.get("4hour", pd.DataFrame())
 
     for sig in signals:
-        sl_ref_low = min(sig['low'], sig['cc_low'])
-        sl_ref_high = max(sig['high'], sig['cc_high'])
-        stop_px = (sl_ref_low - pip_val) if sig['direction'] == "long" else (sl_ref_high + pip_val)
-        
-        # Ensure stop loss is not too close (e.g., less than 10 pips away)
-        if abs(sig['entry_price'] - stop_px) < (10 * pip_val): 
-            # print(f"Skipping trade due to SL too close: Entry {sig['entry_price']}, SL {stop_px}")
+        entry_price = sig['entry_price']
+        direction = sig['direction']
+
+        # Parse S/R levels
+        try:
+            s_15m = json.loads(sig['supports_15m_at_signal']) if sig['supports_15m_at_signal'] else []
+            r_15m = json.loads(sig['resistances_15m_at_signal']) if sig['resistances_15m_at_signal'] else []
+            s_4h = json.loads(sig['supports_4h_at_signal']) if sig['supports_4h_at_signal'] else []
+            r_4h = json.loads(sig['resistances_4h_at_signal']) if sig['resistances_4h_at_signal'] else []
+        except json.JSONDecodeError:
+            # print(f"Skipping trade due to S/R JSON parsing error for signal at {sig['entry_datetime']}")
             continue
+            
+        all_supports = sorted(list(set(s_15m + s_4h)))
+        all_resistances = sorted(list(set(r_15m + r_4h)))
+
+        stop_loss_price = None
+        take_profit_price = None
+
+        if direction == "long":
+            # SL: Highest support strictly below entry
+            potential_sls = [s for s in all_supports if s < entry_price]
+            if potential_sls:
+                stop_loss_price = max(potential_sls)
+            
+            # TP: Lowest resistance strictly above entry
+            potential_tps = [r for r in all_resistances if r > entry_price]
+            if potential_tps:
+                take_profit_price = min(potential_tps)
         
-        risk_distance = abs(sig['entry_price'] - stop_px)
-        tp_px = sig['entry_price'] + (risk_distance * RR_MULTIPLIER) if sig['direction'] == "long" else sig['entry_price'] - (risk_distance * RR_MULTIPLIER)
-        
+        elif direction == "short":
+            # SL: Lowest resistance strictly above entry
+            potential_sls = [r for r in all_resistances if r > entry_price]
+            if potential_sls:
+                stop_loss_price = min(potential_sls)
+
+            # TP: Highest support strictly below entry
+            potential_tps = [s for s in all_supports if s < entry_price]
+            if potential_tps:
+                take_profit_price = max(potential_tps)
+
+        # Validation and Skipping Trades
+        if stop_loss_price is None or take_profit_price is None:
+            # print(f"Skipping trade at {sig['entry_datetime']}: No valid S/R level for SL/TP.")
+            continue
+
+        if abs(entry_price - stop_loss_price) < (MIN_SL_DISTANCE_PIPS * pip_val):
+            # print(f"Skipping trade at {sig['entry_datetime']}: SL too close ({stop_loss_price}). Entry: {entry_price}")
+            continue
+            
+        risk = abs(entry_price - stop_loss_price)
+        reward = abs(take_profit_price - entry_price)
+        if risk == 0 or reward < risk: # Ensure risk is not zero and R:R is at least 1:1
+            # print(f"Skipping trade at {sig['entry_datetime']}: Unfavorable R:R (Risk: {risk:.2f}, Reward: {reward:.2f}). SL: {stop_loss_price}, TP: {take_profit_price}")
+            continue
+
         exit_px, exit_dt, exit_reason, duration = None, None, None, 0
         
         entry_idx = df_5m.index[df_5m['datetime'] == sig['entry_datetime']].tolist()
@@ -391,10 +436,20 @@ def execute_backtest(df_5m, all_tf_data, losing_trades_conn, initial_balance, un
         
         for k in range(entry_idx[0] + 1, len(df_5m)):
             candle = df_5m.iloc[k]
-            if (sig['direction'] == "long" and candle['high'] >= tp_px) or \
-               (sig['direction'] == "short" and candle['low'] <= tp_px):
-                exit_px, exit_dt, exit_reason, duration = tp_px, candle['datetime'], "TP", k - entry_idx[0]; break
+
+            # S/R based SL/TP check
+            if direction == "long":
+                if candle['low'] <= stop_loss_price:
+                    exit_px, exit_dt, exit_reason, duration = stop_loss_price, candle['datetime'], "SL Hit (S/R)", k - entry_idx[0]; break
+                elif candle['high'] >= take_profit_price:
+                    exit_px, exit_dt, exit_reason, duration = take_profit_price, candle['datetime'], "TP Hit (S/R)", k - entry_idx[0]; break
+            elif direction == "short":
+                if candle['high'] >= stop_loss_price:
+                    exit_px, exit_dt, exit_reason, duration = stop_loss_price, candle['datetime'], "SL Hit (S/R)", k - entry_idx[0]; break
+                elif candle['low'] <= take_profit_price:
+                    exit_px, exit_dt, exit_reason, duration = take_profit_price, candle['datetime'], "TP Hit (S/R)", k - entry_idx[0]; break
             
+            # RSI Crossover Stop (secondary exit)
             prev_candle_rsi = df_5m.iloc[k-1]
             if not any(pd.isna(x) for x in [candle[rsi_col], candle[sma_col], prev_candle_rsi[rsi_col], prev_candle_rsi[sma_col]]):
                 if (sig['direction'] == "long" and candle[rsi_col] < candle[sma_col] and prev_candle_rsi[rsi_col] >= prev_candle_rsi[sma_col]) or \
@@ -661,7 +716,8 @@ def main():
         if metrics_summary and losing_trades_conn:
             rsi_long_str = f"< {OPTIMIZED_RSI_LONG_THRESHOLD}"
             rsi_short_str = f"> {OPTIMIZED_RSI_SHORT_THRESHOLD}"
-            save_summary_results_to_db(losing_trades_conn, metrics_summary, rsi_long_str, rsi_short_str, RR_MULTIPLIER)
+            # RR_MULTIPLIER is no longer used for TP, pass None or a descriptive string if schema changed
+            save_summary_results_to_db(losing_trades_conn, metrics_summary, rsi_long_str, rsi_short_str, None) 
             
         calculate_and_print_monthly_performance(executed_trades, INITIAL_BALANCE, df_5m_original)
         
