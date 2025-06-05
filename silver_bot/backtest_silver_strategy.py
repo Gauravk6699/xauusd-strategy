@@ -7,8 +7,13 @@ TABLE_NAME = "xagusd_15min"
 
 # Long Strategy Parameters
 ENTRY_THRESHOLD_PERCENT = 0.005 # 0.5% drop from day's open
-TAKE_PROFIT_PRICE_OFFSET = 0.5   # $0.5 rise from entry price
+TAKE_PROFIT_PRICE_OFFSET = 0.3   # $0.3 rise from entry price
 SWAP_COST_PER_LOT_PER_NIGHT = -22.0 # Daily swap cost for long positions
+
+# Short Strategy Parameters
+SHORT_LOT_SIZE_FRACTION_OF_LONG = 1.0 # Short lot size as a fraction of long lot size
+SHORT_TAKE_PROFIT_PRICE_OFFSET = 1.00  # Updated: $1.00 downward move from short entry for TP
+SHORT_ENTRY_PRICE_OFFSET_FROM_LONG = 2.00 # New: Short entry is $2.00 above long entry
 
 # General Parameters
 STARTING_BALANCE = 100000.0
@@ -38,13 +43,20 @@ def run_backtest(df):
 
     trades = []
     open_long_positions = []
-    # open_short_positions = [] # Removed
+    open_short_positions = []
     equity = STARTING_BALANCE
     peak_equity = STARTING_BALANCE
     max_drawdown = 0.0
     max_concurrent_mae = 0.0
     daily_open_price = None
     current_day_str = None
+    # current_anchor_long_tp = None # Removed: Individual TP for longs
+    active_long_trade_group_ids = set() # To store IDs of all open long trades
+    # current_long_sub_group_opened_count = 0 # Removed: Individual TP for longs
+    
+    # current_anchor_short_tp = None # Removed: Individual TP for shorts
+    active_short_trade_group_ids = set() # To store IDs of all open short trades
+    # current_short_sub_group_opened_count = 0 # Removed for new short TP logic
     # first_ever_open_price is not used by the current short logic, but kept for potential future use or other strategies
     # if not df.empty:
     #     first_ever_open_price = df['open'].iloc[0] 
@@ -93,19 +105,65 @@ def run_backtest(df):
                 })
                 print(f"  LONG TP HIT: PosID {position['id']} exited at {exit_price:.5f} (Entry: {position['entry_price']:.5f}, Gross PnL: {gross_pnl:.2f}, Swap: {swap_charges:.2f}, Spread: {trade_spread_cost:.2f}, MAE: {position.get('mae', 0.0):.2f}, Net PnL: {net_pnl:.2f})")
                 open_long_positions.remove(position)
+                
+                if position['id'] in active_long_trade_group_ids:
+                    active_long_trade_group_ids.remove(position['id'])
+
+                # Removed cluster logic for long TP hit
+                # if not active_long_trade_group_ids and current_anchor_long_tp is not None: 
+                #     print(f"    MAJOR LONG Group Reset: Last trade PosID {position['id']} from group closed. Anchor TP {current_anchor_long_tp:.5f} is now reset.")
+                #     current_anchor_long_tp = None # Reset for the next group
+                #     current_long_sub_group_opened_count = 0 # Reset sub-group counter as the major group ended
+                
                 equity += net_pnl
                 current_drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 and equity < peak_equity else 0.0
                 max_drawdown = max(max_drawdown, current_drawdown)
                 peak_equity = max(peak_equity, equity)
 
+        # --- Manage Open Short Positions ---
+        for position in list(open_short_positions):
+            # MAE for short: price moves UP from entry
+            adverse_move_short = (candle_high - position['entry_price']) * CONTRACT_SIZE * position['size']
+            position['mae'] = max(position.get('mae', 0.0), adverse_move_short)
+
+            if candle_low <= position['tp_price']:
+                exit_price = position['tp_price']
+                # Assuming no swap/spread costs for shorts for simplicity, can be added later if needed
+                swap_charges = 0.0 
+                trade_spread_cost = 0.0
+                gross_pnl = (position['entry_price'] - exit_price) * CONTRACT_SIZE * position['size'] # PnL for short
+                net_pnl = gross_pnl + swap_charges + trade_spread_cost
+
+                trades.append({
+                    "trade_type": "SHORT", "entry_time": position['entry_time'], "entry_price": position['entry_price'],
+                    "exit_time": candle_timestamp, "exit_price": exit_price, "gross_pnl": gross_pnl,
+                    "swap_charges": swap_charges, "spread_cost": trade_spread_cost, "mae": position.get('mae', 0.0),
+                    "pnl": net_pnl, "size": position['size'], "status": "CLOSED_TP"
+                })
+                print(f"  SHORT TP HIT: PosID {position['id']} exited at {exit_price:.5f} (Entry: {position['entry_price']:.5f}, Gross PnL: {gross_pnl:.2f}, Net PnL: {net_pnl:.2f})")
+                open_short_positions.remove(position)
+                
+                if position['id'] in active_short_trade_group_ids:
+                    active_short_trade_group_ids.remove(position['id'])
+                
+                # Removed cluster logic for short TP hit
+                # if not active_short_trade_group_ids and current_anchor_short_tp is not None:
+                #     print(f"    MAJOR SHORT Group Reset: Last trade PosID {position['id']} from group closed. Anchor TP {current_anchor_short_tp:.5f} is now reset.")
+                #     current_anchor_short_tp = None
+                
+                equity += net_pnl
+                current_drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 and equity < peak_equity else 0.0
+                max_drawdown = max(max_drawdown, current_drawdown)
+                peak_equity = max(peak_equity, equity)
+        
         # --- Calculate Current Concurrent MAE ---
         momentary_total_adverse_excursion = 0.0
         for pos_long in open_long_positions:
             adverse_excursion_long = (pos_long['entry_price'] - candle_low) * CONTRACT_SIZE * pos_long['size']
             momentary_total_adverse_excursion += max(0.0, adverse_excursion_long)
-        # for pos_short in open_short_positions: # Removed short MAE calculation
-        #     adverse_excursion_short = (candle_high - pos_short['entry_price']) * CONTRACT_SIZE * pos_short['size']
-        #     momentary_total_adverse_excursion += max(0.0, adverse_excursion_short)
+        for pos_short in open_short_positions:
+            adverse_excursion_short = (candle_high - pos_short['entry_price']) * CONTRACT_SIZE * pos_short['size'] # MAE for short is when price goes up
+            momentary_total_adverse_excursion += max(0.0, adverse_excursion_short)
         max_concurrent_mae = max(max_concurrent_mae, momentary_total_adverse_excursion)
 
         # --- Check for New Long Entry Signals ---
@@ -114,24 +172,51 @@ def run_backtest(df):
 
         if candle_low <= next_entry_target_price:
             entry_price = next_entry_target_price
-            tp_price = entry_price + TAKE_PROFIT_PRICE_OFFSET
-            position_id = f"Pos-{len(trades) + len(open_long_positions) + 1}-{candle_timestamp.strftime('%H%M%S')}" # Removed len(open_short_positions)
+            position_id_long = f"LPos-{len(trades) + len(open_long_positions) + len(open_short_positions) + 1}-{candle_timestamp.strftime('%H%M%S')}"
+
+            # Individual TP Logic for Longs
+            tp_price_for_this_trade = entry_price + TAKE_PROFIT_PRICE_OFFSET
             
             new_long_position = {
-                "id": position_id, "trade_type": "LONG", "entry_time": candle_timestamp,
-                "entry_price": entry_price, "tp_price": tp_price, "size": NUMBER_OF_LOTS,
+                "id": position_id_long, "trade_type": "LONG", "entry_time": candle_timestamp,
+                "entry_price": entry_price, "tp_price": tp_price_for_this_trade, "size": NUMBER_OF_LOTS,
                 "status": "OPEN", "daily_open_ref": daily_open_price, "mae": 0.0
             }
             initial_mae_long = (new_long_position['entry_price'] - candle_low) * CONTRACT_SIZE * new_long_position['size']
             new_long_position['mae'] = max(0.0, initial_mae_long)
             open_long_positions.append(new_long_position)
-            print(f"  NEW LONG: PosID {position_id} opened at {entry_price:.5f} (TP: {tp_price:.5f}, Lots: {NUMBER_OF_LOTS}) based on DailyOpen {daily_open_price:.5f}. Entries today: {entries_today_count + 1}")
+            active_long_trade_group_ids.add(position_id_long) # Still track open longs
+            print(f"  NEW LONG: PosID {position_id_long} opened at {entry_price:.5f} (TP: {tp_price_for_this_trade:.5f}, Lots: {NUMBER_OF_LOTS}) based on DailyOpen {daily_open_price:.5f}. Entries today: {entries_today_count + 1}")
+
+            # --- Simultaneous Short Entry ---
+            # Determine the entry price for the short position
+            short_entry_price = entry_price + SHORT_ENTRY_PRICE_OFFSET_FROM_LONG # Calculate the actual short entry price
+            position_id_short = f"SPos-{len(trades) + len(open_long_positions) + len(open_short_positions) + 1}-{candle_timestamp.strftime('%H%M%S')}"
+            short_size = NUMBER_OF_LOTS * SHORT_LOT_SIZE_FRACTION_OF_LONG
+
+            # Individual TP Logic for Shorts
+            tp_price_for_this_short_trade = short_entry_price - SHORT_TAKE_PROFIT_PRICE_OFFSET
+            
+            new_short_position = {
+                "id": position_id_short, "trade_type": "SHORT", "entry_time": candle_timestamp,
+                "entry_price": short_entry_price,
+                "tp_price": tp_price_for_this_short_trade, # Use the group anchor TP
+                "size": short_size,
+                "status": "OPEN", "daily_open_ref": daily_open_price, "mae": 0.0
+            }
+            # Initial MAE for short: price moves UP from entry
+            initial_mae_short = (candle_high - new_short_position['entry_price']) * CONTRACT_SIZE * new_short_position['size']
+            new_short_position['mae'] = max(0.0, initial_mae_short)
+            open_short_positions.append(new_short_position)
+            active_short_trade_group_ids.add(position_id_short) # Still track open shorts
+            print(f"  NEW SHORT (Hedge): PosID {position_id_short} opened at {short_entry_price:.5f} (TP: {tp_price_for_this_short_trade:.5f}, Lots: {short_size:.2f})")
 
             # --- Short entry logic removed ---
             
             # Same-candle TP check for the new long position
-            if candle_high >= tp_price: 
-                exit_price_immediate = tp_price
+            # Note: tp_price here should refer to the specific trade's TP, which is tp_price_for_this_trade
+            if candle_high >= new_long_position['tp_price']: 
+                exit_price_immediate = new_long_position['tp_price']
                 swap_charges_immediate = 0.0 
                 trade_spread_cost_immediate = SPREAD_COST_PER_LOT * NUMBER_OF_LOTS
                 gross_pnl_immediate = (exit_price_immediate - entry_price) * CONTRACT_SIZE * NUMBER_OF_LOTS
@@ -143,12 +228,52 @@ def run_backtest(df):
                     "swap_charges": swap_charges_immediate, "spread_cost": trade_spread_cost_immediate,
                     "mae": mae_immediate, "pnl": net_pnl_immediate, "size": NUMBER_OF_LOTS, "status": "CLOSED_TP_SAME_CANDLE"
                 })
-                print(f"  LONG TP HIT (Same Candle): PosID {position_id} exited at {exit_price_immediate:.5f} (Gross PnL: {gross_pnl_immediate:.2f}, Swap: {swap_charges_immediate:.2f}, Spread: {trade_spread_cost_immediate:.2f}, MAE: {mae_immediate:.2f}, Net PnL: {net_pnl_immediate:.2f})")
+                print(f"  LONG TP HIT (Same Candle): PosID {position_id_long} exited at {exit_price_immediate:.5f} (Gross PnL: {gross_pnl_immediate:.2f}, Swap: {swap_charges_immediate:.2f}, Spread: {trade_spread_cost_immediate:.2f}, MAE: {mae_immediate:.2f}, Net PnL: {net_pnl_immediate:.2f})")
                 open_long_positions.remove(new_long_position)
+                # Also remove from active group and check for reset
+                if new_long_position['id'] in active_long_trade_group_ids:
+                    active_long_trade_group_ids.remove(new_long_position['id'])
+                # Removed cluster logic for same-candle long TP hit
+                # if not active_long_trade_group_ids and current_anchor_long_tp is not None:
+                #     print(f"    MAJOR LONG Group Reset (Same Candle): Last trade PosID {new_long_position['id']} from group closed. Anchor TP {current_anchor_long_tp:.5f} is now reset.")
+                #     current_anchor_long_tp = None
+                #     current_long_sub_group_opened_count = 0 # Reset sub-group counter
                 equity += net_pnl_immediate
                 current_drawdown_long_tp = (peak_equity - equity) / peak_equity if peak_equity > 0 and equity < peak_equity else 0.0
                 max_drawdown = max(max_drawdown, current_drawdown_long_tp)
                 peak_equity = max(peak_equity, equity)
+
+            # Same-candle TP check for the new short position
+            if candle_low <= new_short_position['tp_price']: 
+                exit_price_immediate_short = new_short_position['tp_price']
+                # Assuming no swap/spread for shorts for now
+                swap_charges_immediate_short = 0.0
+                trade_spread_cost_immediate_short = 0.0 
+                gross_pnl_immediate_short = (new_short_position['entry_price'] - exit_price_immediate_short) * CONTRACT_SIZE * short_size # Corrected to use short's entry price
+                net_pnl_immediate_short = gross_pnl_immediate_short # + swap_charges_immediate_short + trade_spread_cost_immediate_short
+                mae_immediate_short = new_short_position['mae']
+                trades.append({
+                    "trade_type": "SHORT", "entry_time": candle_timestamp, "entry_price": new_short_position['entry_price'], # Corrected to use short's entry price
+                    "exit_time": candle_timestamp, "exit_price": exit_price_immediate_short, "gross_pnl": gross_pnl_immediate_short,
+                    "swap_charges": swap_charges_immediate_short, "spread_cost": trade_spread_cost_immediate_short,
+                    "mae": mae_immediate_short, "pnl": net_pnl_immediate_short, "size": short_size, "status": "CLOSED_TP_SAME_CANDLE"
+                })
+                print(f"  SHORT TP HIT (Same Candle): PosID {position_id_short} exited at {exit_price_immediate_short:.5f} (Gross PnL: {gross_pnl_immediate_short:.2f}, Net PnL: {net_pnl_immediate_short:.2f})")
+                open_short_positions.remove(new_short_position)
+
+                if new_short_position['id'] in active_short_trade_group_ids:
+                    active_short_trade_group_ids.remove(new_short_position['id'])
+                
+                # Removed cluster logic for same-candle short TP hit
+                # if not active_short_trade_group_ids and current_anchor_short_tp is not None:
+                #     print(f"    MAJOR SHORT Group Reset (Same Candle): Last trade PosID {new_short_position['id']} from group closed. Anchor TP {current_anchor_short_tp:.5f} is now reset.")
+                #     current_anchor_short_tp = None
+                
+                equity += net_pnl_immediate_short
+                current_drawdown_short_tp = (peak_equity - equity) / peak_equity if peak_equity > 0 and equity < peak_equity else 0.0
+                max_drawdown = max(max_drawdown, current_drawdown_short_tp)
+                peak_equity = max(peak_equity, equity)
+            # The following block was a duplication and is now removed.
 
     # At the end of backtest, mark remaining open positions
     if not df.empty:
@@ -172,8 +297,19 @@ def run_backtest(df):
             })
             print(f"  END OF BACKTEST (LONG): PosID {pos['id']} still open. Entry: {pos['entry_price']:.5f}, Current Price: {last_close_price:.5f}, Unrealized Gross PnL: {gross_pnl:.2f}, Swap: {swap_charges:.2f}, Spread: {trade_spread_cost:.2f}, MAE: {pos.get('mae', 0.0):.2f}, Unrealized Net PnL: {net_pnl:.2f}")
 
-        # for pos in open_short_positions: # Removed processing of open short positions
-        #     # ...
+        for pos in open_short_positions:
+            # Assuming no swap/spread for open shorts for now
+            swap_charges = 0.0
+            trade_spread_cost = 0.0
+            gross_pnl = (pos['entry_price'] - last_close_price) * CONTRACT_SIZE * pos['size'] # PnL for short
+            net_pnl = gross_pnl + swap_charges + trade_spread_cost
+            trades.append({
+                "trade_type": "SHORT", "entry_time": pos['entry_time'], "entry_price": pos['entry_price'],
+                "exit_time": "STILL_OPEN", "exit_price": last_close_price, "gross_pnl": gross_pnl,
+                "swap_charges": swap_charges, "spread_cost": trade_spread_cost, "mae": pos.get('mae', 0.0),
+                "pnl": net_pnl, "size": pos['size'], "status": "STILL_OPEN"
+            })
+            print(f"  END OF BACKTEST (SHORT): PosID {pos['id']} still open. Entry: {pos['entry_price']:.5f}, Current Price: {last_close_price:.5f}, Unrealized Gross PnL: {gross_pnl:.2f}, Unrealized Net PnL: {net_pnl:.2f}")
     
     return trades, equity, max_drawdown, max_concurrent_mae
 
