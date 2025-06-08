@@ -1,0 +1,25 @@
+--- Backtest Results ---
+Starting Balance: $100,000.00
+Ending Equity: $4,506,848.00
+Net P&L (from equity change): $4,406,848.00
+Maximum Drawdown: 0.13%
+Max Concurrent MAE: $798,596.05
+
+--- Trade Performance ---
+Total Trades Recorded (incl. open): 1222
+Total Gross P&L (all trades): $4,574,336.06
+Total Swap Charges (all trades): $-172,964.00
+Total Spread Costs (all trades): $0.00
+Total Net P&L (all trades, from log): $4,401,372.06
+
+Number of Closed Trades: 1217
+  Winning Closed Trades (Net P&L > 0): 1207
+  Win Rate (Closed Trades): 99.18%
+  Average Gross P&L per Closed Trade: $3,755.14
+  Average Swap Cost per Closed Trade: $-134.06
+  Average Spread Cost per Closed Trade: $0.00
+  Average MAE per Closed Trade: $2425.36
+  Average Net P&L per Closed Trade: $3621.07
+
+Number of Trades Still Open: 5
+  Unrealized Net P&L for Open Trades: $-5475.94

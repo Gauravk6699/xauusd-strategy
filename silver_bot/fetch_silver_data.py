@@ -14,8 +14,9 @@ INTERVAL_REQUEST = "minute"
 RESAMPLE_INTERVAL = "15T"
 DATABASE_NAME = "silver_bot/xagusd_15min_data.db"
 TABLE_NAME = "xagusd_15min"
-DAYS_PER_CHUNK = 2 # Fetch data in 2-day chunks as per API limit
-REQUEST_DELAY_SECONDS = 1 # Delay between API calls
+DAYS_PER_CHUNK = 2 # Fetch data in 2-day chunks as per API limit (for Tradermade, not used for Polygon)
+REQUEST_DELAY_SECONDS = 5 # Delay between paginated API calls within a single fetch_polygon_data call (Increased from 1)
+CHUNK_FETCH_DELAY_SECONDS = 10 # Delay between fetching major chunks (e.g., 6-month periods)
 
 def get_overall_date_range():
     """Returns the overall start and end date for the last 30 days."""
@@ -26,10 +27,10 @@ def get_overall_date_range():
     return start_date_dt, overall_end_dt
 
 def get_overall_date_range_for_polygon_test():
-    """Returns start and end date for the last 365 days for Polygon fetch.""" # Docstring updated
+    """Returns start and end date from January 1, 2022, to now for Polygon fetch."""
     end_date_dt = datetime.now()
-    start_date_dt = end_date_dt - timedelta(days=365) # Changed to 365 days
-    print(f"Polygon Fetch: Fetching data for the last 365 days: {start_date_dt.strftime('%Y-%m-%d')} to {end_date_dt.strftime('%Y-%m-%d')}") # Print statement updated
+    start_date_dt = datetime(2022, 1, 1) # Changed to January 1, 2022
+    print(f"Polygon Fetch: Fetching data from {start_date_dt.strftime('%Y-%m-%d')} to {end_date_dt.strftime('%Y-%m-%d')}")
     return start_date_dt, end_date_dt
 
 def fetch_polygon_data(forex_ticker, multiplier, timespan, start_date_str, end_date_str):
@@ -70,7 +71,7 @@ def fetch_polygon_data(forex_ticker, multiplier, timespan, start_date_str, end_d
         # Basic pagination handling
         next_url = data.get("next_url")
         request_count = 1
-        max_requests = 10 # Safety break for pagination loop
+        max_requests = 20 # Safety break for pagination loop (Increased from 10)
 
         while next_url and request_count < max_requests:
             print(f"Fetching next page from Polygon (request {request_count + 1})...")
@@ -323,50 +324,100 @@ def insert_data_into_db(conn, data_values):
     return inserted_count, skipped_count
 
 def main():
-    # --- Polygon.io Data Fetch (365 days) ---
-    print("--- Starting Polygon.io API Data Fetch (365 days) ---") # Updated print
-    test_start_dt, test_end_dt = get_overall_date_range_for_polygon_test() # This function now returns 365 days
+    # --- Polygon.io Data Fetch (from Jan 1, 2022, in chunks) ---
+    print("--- Starting Polygon.io API Data Fetch (from Jan 1, 2022, in chunks) ---")
     
-    # Parameters for Polygon
-    # forexTicker, multiplier, timespan, from, to
-    # Assumption: POLYGON_SYMBOL = "C:XAGUSD"
-    # Assumption: 15 minute bars -> multiplier=15, timespan='minute'
-    # Assumption: from/to format YYYY-MM-DD
+    overall_start_date = datetime(2022, 1, 1)
+    overall_end_date = datetime.now()
     
-    polygon_data = fetch_polygon_data(
-        forex_ticker=POLYGON_SYMBOL,
-        multiplier="15", # As string, as per typical URL construction
-        timespan="minute",
-        start_date_str=test_start_dt.strftime("%Y-%m-%d"),
-        end_date_str=test_end_dt.strftime("%Y-%m-%d")
-    )
+    current_chunk_start_date = overall_start_date
+    
+    import os
+    db_dir = os.path.dirname(DATABASE_NAME)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+    
+    conn = None
+    total_inserted_all_chunks = 0
+    total_skipped_all_chunks = 0
 
-    if polygon_data:
-        # print(f"\n--- Polygon Test Data Sample (first 5 records if available) ---") # Commented out sample print
-        # for i, record in enumerate(polygon_data[:5]):
-        #     print(record)
-        # print(f"Total records fetched for Polygon test: {len(polygon_data)}")
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        create_database_table(conn) # Ensure table exists
+
+        while current_chunk_start_date < overall_end_date:
+            # Determine end of the current 6-month chunk
+            # A simple way to add 6 months is tricky with datetime. A more robust way:
+            year = current_chunk_start_date.year
+            month = current_chunk_start_date.month + 6
+            day = current_chunk_start_date.day
+
+            if month > 12:
+                year += (month -1) // 12
+                month = (month -1) % 12 + 1
+            
+            # Handle cases like Jan 31 + 6 months -> July 31, but Feb 28 + 6 months -> Aug 28
+            # For simplicity in chunking, just aim for end of month or specific day.
+            # Let's use a fixed day for simplicity or end of month logic.
+            # A simpler approach for 6 month step:
+            next_month_val = current_chunk_start_date.month + 5 # 0-indexed for month end, so +5 for 6 months
+            next_year_val = current_chunk_start_date.year + next_month_val // 12
+            next_month_val = next_month_val % 12 + 1
+
+            # Find the last day of that target month
+            if next_month_val == 12:
+                current_chunk_end_date = datetime(next_year_val, next_month_val, 31)
+            else:
+                current_chunk_end_date = datetime(next_year_val, next_month_val + 1, 1) - timedelta(days=1)
+            
+            # Ensure chunk end date does not exceed overall end date
+            current_chunk_end_date = min(current_chunk_end_date, overall_end_date)
+
+            # Ensure start is not after end (can happen on the last chunk)
+            if current_chunk_start_date > current_chunk_end_date:
+                print(f"Chunk start date {current_chunk_start_date.strftime('%Y-%m-%d')} is after chunk end date {current_chunk_end_date.strftime('%Y-%m-%d')}. Ending fetch.")
+                break
+
+            print(f"\nFetching chunk from {current_chunk_start_date.strftime('%Y-%m-%d')} to {current_chunk_end_date.strftime('%Y-%m-%d')}")
+
+            polygon_data = fetch_polygon_data(
+                forex_ticker=POLYGON_SYMBOL,
+                multiplier="15",
+                timespan="minute",
+                start_date_str=current_chunk_start_date.strftime("%Y-%m-%d"),
+                end_date_str=current_chunk_end_date.strftime("%Y-%m-%d")
+            )
+
+            if polygon_data:
+                print(f"Fetched {len(polygon_data)} records for chunk. Proceeding to database insertion.")
+                print(f"Inserting Polygon.io data into {DATABASE_NAME}, table {TABLE_NAME}...")
+                inserted, skipped = insert_data_into_db(conn, polygon_data) # Pass connection
+                total_inserted_all_chunks += inserted
+                total_skipped_all_chunks += skipped
+                print(f"Chunk insertion complete. Inserted new: {inserted}, Skipped existing/errors: {skipped}")
+                conn.commit() # Commit after each successful chunk insertion
+            else:
+                print(f"Failed to fetch data for chunk {current_chunk_start_date.strftime('%Y-%m-%d')} to {current_chunk_end_date.strftime('%Y-%m-%d')}. Skipping this chunk.")
+
+            # Move to the next chunk
+            current_chunk_start_date = current_chunk_end_date + timedelta(days=1)
+
+            if current_chunk_start_date < overall_end_date:
+                print(f"Waiting for {CHUNK_FETCH_DELAY_SECONDS}s before next major chunk request...")
+                time.sleep(CHUNK_FETCH_DELAY_SECONDS)
         
-        print(f"Fetched {len(polygon_data)} records from Polygon.io. Proceeding to database insertion.")
-        import os
-        db_dir = os.path.dirname(DATABASE_NAME)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-        conn = None
-        try:
-            conn = sqlite3.connect(DATABASE_NAME)
-            create_database_table(conn)
-            # Optional: Clear existing data if needed for a fresh load
-            # print(f"Clearing existing data in {TABLE_NAME}...")
-            # cursor = conn.cursor(); cursor.execute(f"DELETE FROM {TABLE_NAME}"); conn.commit()
-            print(f"Inserting Polygon.io data into {DATABASE_NAME}, table {TABLE_NAME}...")
-            inserted, skipped = insert_data_into_db(conn, polygon_data) # Use polygon_data
-            print(f"Data insertion complete. Inserted new: {inserted}, Skipped existing/errors: {skipped}")
-        except sqlite3.Error as e: print(f"SQLite error: {e}")
-        finally:
-            if conn: conn.close()
-    else:
-        print("Failed to fetch data from Polygon.io. No data to insert into database.")
+        print(f"\n--- Overall Data Fetch Complete ---")
+        print(f"Total new records inserted across all chunks: {total_inserted_all_chunks}")
+        print(f"Total records skipped (existing/errors) across all chunks: {total_skipped_all_chunks}")
+
+    except sqlite3.Error as e:
+        print(f"SQLite error during chunk processing: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred in main during chunk processing: {e}")
+    finally:
+        if conn:
+            conn.close()
+            print("Database connection closed.")
 
     # --- Original Tradermade Fetch (Now fully commented out as we are using Polygon) ---
     # overall_start_dt, overall_end_dt = get_overall_date_range()
